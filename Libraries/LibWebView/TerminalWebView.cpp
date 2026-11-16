@@ -526,6 +526,20 @@ bool TerminalWebView::handle_browser_shortcut(TerminalKeyReport const& report)
         reload();
         return true;
     }
+    // Many terminals keep Ctrl with + - 0 for their own font size; zi, zo and z0 zoom there too.
+    if (is_key_with(KeyCode::Key_Equal, KeyModifier::Mod_Ctrl) || is_key_with(KeyCode::Key_Plus, KeyModifier::Mod_Ctrl)
+        || is_key_with(KeyCode::Key_Equal, KeyModifier::Mod_Ctrl | KeyModifier::Mod_Shift)) {
+        zoom_in();
+        return true;
+    }
+    if (is_key_with(KeyCode::Key_Minus, KeyModifier::Mod_Ctrl)) {
+        zoom_out();
+        return true;
+    }
+    if (is_key_with(KeyCode::Key_0, KeyModifier::Mod_Ctrl)) {
+        reset_zoom();
+        return true;
+    }
     // Terminals that follow the macOS convention send Option+Left and Option+Right as Alt+B and Alt+F, the keys that
     // move a shell's cursor by words.
     if (is_key_with(KeyCode::Key_Left, KeyModifier::Mod_Alt) || is_key_with(KeyCode::Key_B, KeyModifier::Mod_Alt)) {
@@ -537,6 +551,117 @@ bool TerminalWebView::handle_browser_shortcut(TerminalKeyReport const& report)
         return true;
     }
     return false;
+}
+
+// Vimium's step: what j and k scroll, in the same units as a wheel report.
+static constexpr int vim_scroll_step_pixels = 60;
+
+void TerminalWebView::scroll_page_by(int x_pixels, int y_pixels)
+{
+    auto viewport = viewport_size().to_type<int>();
+    auto center = Gfx::IntPoint { max(0, viewport.width() / 2), max(0, viewport.height() / 2) };
+    auto event = mouse_event(Web::MouseEvent::Type::MouseWheel, center, MouseButton::None, m_held_mouse_buttons, KeyModifier::Mod_None);
+    event.wheel_delta_x = x_pixels;
+    event.wheel_delta_y = y_pixels;
+    event.wheel_tick_120ths_x = Web::wheel_tick_120ths_from_pixel_delta(event.wheel_delta_x, Web::WheelDeltaPrecision::Discrete);
+    event.wheel_tick_120ths_y = Web::wheel_tick_120ths_from_pixel_delta(event.wheel_delta_y, Web::WheelDeltaPrecision::Discrete);
+    event.wheel_delta_precision = Web::WheelDeltaPrecision::Discrete;
+    enqueue_input_event(move(event));
+}
+
+void TerminalWebView::press_page_key(KeyCode key)
+{
+    for (auto type : { Web::KeyEvent::Type::KeyDown, Web::KeyEvent::Type::KeyUp }) {
+        Web::KeyEvent event {};
+        event.type = type;
+        event.key = key;
+        event.modifiers = KeyModifier::Mod_None;
+        enqueue_input_event(move(event));
+    }
+}
+
+// Vim-style keys while no text field has focus: j k h l scroll, d u scroll half a page, gg and G go to the top and
+// bottom, H and L go back and forward, zi zo z0 zoom, and i passes keys to the page until Escape.
+bool TerminalWebView::handle_vim_key(TerminalKeyReport const& report)
+{
+    if (report.phase == TerminalKeyReport::Phase::Release)
+        return false;
+
+    if (m_vim_passes_keys) {
+        if (report.key != KeyCode::Key_Escape || report.modifiers != KeyModifier::Mod_None)
+            return false;
+        m_vim_passes_keys = false;
+        draw_status_line();
+        return true;
+    }
+
+    if (input_method_state().is_enabled || (report.modifiers & (KeyModifier::Mod_Ctrl | KeyModifier::Mod_Alt | KeyModifier::Mod_Super)) != 0) {
+        m_vim_prefix.clear();
+        return false;
+    }
+
+    auto code_point = code_point_for_key_event(report);
+    auto is_repeat = report.phase == TerminalKeyReport::Phase::Repeat;
+
+    if (auto prefix = exchange(m_vim_prefix, {}); prefix.has_value()) {
+        if (*prefix == 'g' && code_point == 'g')
+            press_page_key(KeyCode::Key_Home);
+        else if (*prefix == 'z' && code_point == 'i')
+            zoom_in();
+        else if (*prefix == 'z' && code_point == 'o')
+            zoom_out();
+        else if (*prefix == 'z' && code_point == '0')
+            reset_zoom();
+        // As in Vim, an unknown second key ends the command and does nothing else.
+        return true;
+    }
+
+    auto half_page = max(vim_scroll_step_pixels, static_cast<int>(viewport_size().height() / device_pixel_ratio() / 2));
+    switch (code_point) {
+    case 'j':
+        scroll_page_by(0, vim_scroll_step_pixels);
+        return true;
+    case 'k':
+        scroll_page_by(0, -vim_scroll_step_pixels);
+        return true;
+    case 'l':
+        scroll_page_by(vim_scroll_step_pixels, 0);
+        return true;
+    case 'h':
+        scroll_page_by(-vim_scroll_step_pixels, 0);
+        return true;
+    case 'd':
+        scroll_page_by(0, half_page);
+        return true;
+    case 'u':
+        scroll_page_by(0, -half_page);
+        return true;
+    case 'G':
+        if (!is_repeat)
+            press_page_key(KeyCode::Key_End);
+        return true;
+    case 'H':
+        if (!is_repeat)
+            traverse_the_history_by_delta(-1);
+        return true;
+    case 'L':
+        if (!is_repeat)
+            traverse_the_history_by_delta(1);
+        return true;
+    case 'g':
+    case 'z':
+        if (!is_repeat)
+            m_vim_prefix = code_point;
+        return true;
+    case 'i':
+        if (!is_repeat) {
+            m_vim_passes_keys = true;
+            draw_status_line();
+        }
+        return true;
+    default:
+        return false;
+    }
 }
 
 void TerminalWebView::handle_url_prompt_key(TerminalKeyReport const& report)
@@ -579,6 +704,8 @@ void TerminalWebView::handle_key_report(TerminalKeyReport const& report)
     }
 
     if (report.phase != TerminalKeyReport::Phase::Release && handle_browser_shortcut(report))
+        return;
+    if (handle_vim_key(report))
         return;
 
     auto code_point = code_point_for_key_event(report);
@@ -680,6 +807,8 @@ void TerminalWebView::draw_status_line()
     } else {
         auto url = displayed_url().serialize();
         auto heading = title().is_empty() ? url.to_byte_string() : title().to_byte_string();
+        if (m_vim_passes_keys)
+            text.append(" -- PASS KEYS (esc) --"sv);
         text.appendff(" {} — {}", heading, url);
         text.append("   ctrl-l url · ctrl-r reload · alt-←/→ history · ctrl-q quit"sv);
         if (!m_notice.is_empty())

@@ -72,6 +72,9 @@ private:
     void handle_mouse_report(TerminalMouseReport const&);
     void handle_key_report(TerminalKeyReport const&);
     bool handle_browser_shortcut(TerminalKeyReport const&);
+    bool handle_vim_key(TerminalKeyReport const&);
+    void scroll_page_by(int x_pixels, int y_pixels);
+    void press_page_key(Web::UIEvents::KeyCode);
     void handle_url_prompt_key(TerminalKeyReport const&);
     void handle_command(TerminalCommand const&);
 
@@ -107,6 +110,10 @@ private:
     int m_click_count { 0 };
 
     Optional<ByteString> m_url_prompt_text;
+    // Vim-style keys: the first key of a two-key command (g or z), and whether keys go to the page as typed
+    // until Escape (entered with i), for pages with shortcuts of their own.
+    Optional<u32> m_vim_prefix;
+    bool m_vim_passes_keys { false };
     ByteString m_notice;
     RefPtr<Core::Timer> m_notice_timer;
     ByteString m_drawn_status_line;
