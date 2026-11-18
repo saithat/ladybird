@@ -1722,7 +1722,9 @@ WebIDL::ExceptionOr<void> Document::close()
         return {};
 
     // run() may have paused on a blocking script (e.g. from document.write inside an inline script).
-    if (has_pending_parsing_blocking_script()) {
+    // NB: An SVG script that the parser is executing keeps the parser paused, so run() did not tokenize anything. The
+    //     outermost invocation of the parser reaches the explicit "EOF" character once that script is done.
+    if (has_pending_parsing_blocking_script() || parser->is_paused()) {
         parser->set_post_parse_action(move(finish_script_created_parser));
         return {};
     }
@@ -11748,7 +11750,7 @@ ElementByIdMap& Document::element_by_id() const
     return *m_element_by_id;
 }
 
-Utf16String Document::dump_display_list()
+Utf16String Document::dump_display_list(Painting::DisplayListDumpOptions const& options)
 {
     Layout::ForcedReadScope read { *this };
     update_layout(UpdateLayoutReason::DumpDisplayList);
@@ -11759,10 +11761,11 @@ Utf16String Document::dump_display_list()
     if (paint_state().has_visual_context_tree(read))
         schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope::FreshTree);
 
-    if (!record_display_list(read, HTML::PaintConfig { .records_whole_document = true }, Painting::PaintCommandCacheMode::ReadOnly))
+    HTML::PaintConfig config { .records_whole_document = true, .notes_record_origins = options.owners || options.text || options.jsonl };
+    if (!record_display_list(read, config, Painting::PaintCommandCacheMode::ReadOnly))
         return "No display list"_utf16;
 
-    return Painting::serialize_painting_dump(read, *this);
+    return Painting::serialize_painting_dump(read, *this, options);
 }
 
 Utf16String Document::dump_stacking_context_tree()

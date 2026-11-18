@@ -24,6 +24,7 @@ if (BUILD_TESTING AND NOT WIN32)
     endif()
 
     ladybird_python_test(test-webdriver-bidi.py ARGS $<TARGET_FILE:WebDriver>)
+    ladybird_python_test(test-webdriver-command-privileges.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-content-blockers.py ARGS $<TARGET_FILE:WebDriver> TIMEOUT 180)
     ladybird_python_test(test-webdriver-delete-session.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-element-screenshot.py ARGS $<TARGET_FILE:WebDriver>)
@@ -33,6 +34,7 @@ if (BUILD_TESTING AND NOT WIN32)
     if (PDFJS_FOUND)
         ladybird_python_test(test-webdriver-pdf-viewer-ignores-the-csp-of-its-pdf.py ARGS $<TARGET_FILE:WebDriver>)
     endif()
+    ladybird_python_test(test-webdriver-rejects-web-page-requests.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-screenshot-with-cross-site-iframe.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-search-engine-settings.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-set-permission.py ARGS $<TARGET_FILE:WebDriver>)
@@ -86,6 +88,7 @@ set(TEST_SOURCES
     TestStorageJar.cpp
     TestTabIndicators.cpp
     TestTabPerformanceStats.cpp
+    TestUpdateCheck.cpp
     TestWebDriverBiDiNetwork.cpp
     TestWebViewURL.cpp
     TestWebWorkerClient.cpp

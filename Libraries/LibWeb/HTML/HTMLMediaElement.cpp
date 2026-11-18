@@ -287,7 +287,9 @@ void HTMLMediaElement::finalize()
 
     if (m_playback_manager) {
         m_playback_manager->on_playback_state_change = nullptr;
+        m_playback_manager->on_playback_state_settled_change = nullptr;
         m_playback_manager->on_buffered_ranges_change = nullptr;
+        m_playback_manager->on_seekable_ranges_change = nullptr;
     }
     release_active_video_sink();
 
@@ -561,9 +563,20 @@ GC::Ref<TimeRanges> HTMLMediaElement::seekable() const
 {
     // The seekable attribute must return a new static normalized TimeRanges object that represents the ranges of the media resource, if any, that the
     // user agent is able to seek to, at the time the attribute is evaluated.
-    // FIXME: Implement the seekable steps from the Media Source Extensions spec to handle unbounded resources.
     auto time_ranges = TimeRanges::create();
-    time_ranges->add_range(0, m_duration);
+
+    // https://w3c.github.io/media-source/#htmlmediaelement-extensions-seekable
+    // If recent duration equals NaN:
+    //     Return an empty TimeRanges object.
+    if (isnan(m_duration))
+        return time_ranges;
+
+    if (!m_playback_manager) {
+        time_ranges->add_range(0, m_duration);
+        return time_ranges;
+    }
+    if (auto range = m_playback_manager->seekable_time_ranges(); range.has_value())
+        time_ranges->add_range(range->start.to_seconds_f64(), range->end.to_seconds_f64());
     return time_ranges;
 }
 
@@ -720,7 +733,7 @@ bool HTMLMediaElement::ended() const
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#durationChange
-void HTMLMediaElement::set_duration(double duration)
+void HTMLMediaElement::set_duration(double duration, Optional<double> playback_position_before_the_change)
 {
     // When the length of the media resource changes to a known value (e.g. from being unknown to known, or from a previously established length to a new
     // length), the user agent must queue a media element task given the media element to fire an event named durationchange at the media element. (The event
@@ -731,7 +744,7 @@ void HTMLMediaElement::set_duration(double duration)
             self.dispatch_event(DOM::Event::create(HTML::relevant_global_object(self), HTML::EventNames::durationchange));
         }));
 
-        if (current_playback_position() > duration)
+        if (playback_position_before_the_change.value_or(current_playback_position()) > duration)
             seek_element(duration);
     }
 
@@ -1037,6 +1050,7 @@ public:
     SourceElementSelector(GC::Ref<HTMLMediaElement> media_element, GC::Ref<HTMLSourceElement> candidate)
         : m_media_element(media_element)
         , m_candidate(candidate)
+        , m_node_before_pointer(candidate)
     {
     }
 
@@ -1045,7 +1059,7 @@ public:
         Base::visit_edges(visitor);
         visitor.visit(m_media_element);
         visitor.visit(m_candidate);
-        visitor.visit(m_previously_failed_candidate);
+        visitor.visit(m_node_before_pointer);
     }
 
     void process_candidate()
@@ -1103,10 +1117,23 @@ public:
 
     void process_next_candidate()
     {
-        if (!m_previously_failed_candidate)
+        if (!m_waiting)
             return;
 
-        wait_for_next_candidate(*m_previously_failed_candidate);
+        wait_for_next_candidate();
+    }
+
+    // If the node before pointer is removed: Let pointer be the point between the node after pointer and the node
+    // before the node after pointer. In other words, pointer doesn't move relative to the remaining nodes.
+    void node_removed(DOM::Node const& node, GC::Ptr<DOM::Node> old_previous_sibling)
+    {
+        if (m_node_before_pointer.ptr() == &node)
+            m_node_before_pointer = old_previous_sibling;
+    }
+
+    void all_children_removed()
+    {
+        m_node_before_pointer = nullptr;
     }
 
 private:
@@ -1125,40 +1152,43 @@ private:
             // 11. ⌛ Forget the media element's media-resource-specific tracks.
             selector.m_media_element->forget_media_resource_specific_tracks();
 
-            selector.find_next_candidate(selector.m_candidate);
+            selector.find_next_candidate();
         }));
     }
 
-    void find_next_candidate(GC::Ref<DOM::Node> previous_candidate)
+    GC::Ptr<DOM::Node> node_after(GC::Ptr<DOM::Node> node_before_pointer) const
+    {
+        return node_before_pointer ? node_before_pointer->next_sibling() : m_media_element->first_child();
+    }
+
+    void find_next_candidate()
     {
         // 12. ⌛ Find next candidate: Let candidate be null.
         GC::Ptr<HTMLSourceElement> candidate;
 
-        // 13. ⌛ Search loop: If the node after pointer is the end of the list, then jump to the waiting step below.
-        auto* next_sibling = previous_candidate->next_sibling();
-        if (!next_sibling) {
-            waiting(previous_candidate);
-            return;
-        }
+        while (!candidate) {
+            // 13. ⌛ Search loop: If the node after pointer is the end of the list, then jump to the waiting step below.
+            auto node_after_pointer = node_after(m_node_before_pointer);
+            if (!node_after_pointer) {
+                waiting();
+                return;
+            }
 
-        // 14. ⌛ If the node after pointer is a source element, let candidate be that element.
-        if (auto* source_element = as_if<HTMLSourceElement>(next_sibling))
-            candidate = source_element;
+            // 14. ⌛ If the node after pointer is a source element, let candidate be that element.
+            candidate = as_if<HTMLSourceElement>(*node_after_pointer);
 
-        // 15. ⌛ Advance pointer so that the node before pointer is now the node that was after pointer, and the node
-        //     after pointer is the node after the node that used to be after pointer, if any.
+            // 15. ⌛ Advance pointer so that the node before pointer is now the node that was after pointer, and the node
+            //     after pointer is the node after the node that used to be after pointer, if any.
+            m_node_before_pointer = node_after_pointer;
 
-        // 16. ⌛ If candidate is null, jump back to the search loop step. Otherwise, jump back to the process candidate step.
-        if (!candidate) {
-            find_next_candidate(*next_sibling);
-            return;
+            // 16. ⌛ If candidate is null, jump back to the search loop step. Otherwise, jump back to the process candidate step.
         }
 
         m_candidate = *candidate;
         process_candidate();
     }
 
-    void waiting(GC::Ref<DOM::Node> previous_candidate)
+    void waiting()
     {
         // 17. ⌛ Waiting: Set the element's networkState attribute to the NETWORK_NO_SOURCE value.
         m_media_element->set_network_state(HTMLMediaElement::NetworkState::NoSource);
@@ -1175,19 +1205,19 @@ private:
         // 20. End the synchronous section, continuing the remaining steps in parallel.
 
         // 21. Wait until the node after pointer is a node other than the end of the list. (This step might wait forever.)
-        wait_for_next_candidate(previous_candidate);
+        wait_for_next_candidate();
     }
 
-    void wait_for_next_candidate(GC::Ref<DOM::Node> previous_candidate)
+    void wait_for_next_candidate()
     {
         // NOTE: If there isn't another candidate to check, we implement the "waiting" step by returning until the media
         //       element's children have changed.
-        if (previous_candidate->next_sibling() == nullptr) {
-            m_previously_failed_candidate = previous_candidate;
+        if (!node_after(m_node_before_pointer)) {
+            m_waiting = true;
             return;
         }
 
-        m_previously_failed_candidate = nullptr;
+        m_waiting = false;
 
         // FIXME: 22. Await a stable state. The synchronous section consists of all the remaining steps of this algorithm until
         //            the algorithm says the synchronous section has ended. (Steps in synchronous sections are marked with ⌛.)
@@ -1200,12 +1230,13 @@ private:
         m_media_element->set_network_state(HTMLMediaElement::NetworkState::Loading);
 
         // 25. ⌛ Jump back to the find next candidate step above.
-        find_next_candidate(previous_candidate);
+        find_next_candidate();
     }
 
     GC::Ref<HTMLMediaElement> m_media_element;
     GC::Ref<HTMLSourceElement> m_candidate;
-    GC::Ptr<DOM::Node> m_previously_failed_candidate;
+    bool m_waiting { false };
+    GC::Ptr<DOM::Node> m_node_before_pointer;
 };
 
 GC_DEFINE_ALLOCATOR(SourceElementSelector);
@@ -1214,8 +1245,13 @@ void HTMLMediaElement::children_changed(ChildrenChangedMetadata const& metadata)
 {
     Base::children_changed(metadata);
 
-    if (m_source_element_selector)
+    if (m_source_element_selector) {
+        if (metadata.type == ChildrenChangedMetadata::Type::Removal)
+            m_source_element_selector->node_removed(*metadata.node, metadata.old_previous_sibling);
+        else if (metadata.type == ChildrenChangedMetadata::Type::AllChildrenRemoved)
+            m_source_element_selector->all_children_removed();
         m_source_element_selector->process_next_candidate();
+    }
 }
 
 // https://html.spec.whatwg.org/multipage/media.html#concept-media-load-algorithm
@@ -2492,12 +2528,20 @@ void HTMLMediaElement::set_up_playback_manager_for_remote()
     m_playback_manager->on_playback_state_change = GC::weak_callback(*this, [](auto& self) {
         self.on_playback_manager_state_change();
     });
+    m_playback_manager->on_playback_state_settled_change = GC::weak_callback(*this, [](auto& self) {
+        self.update_pending_activity();
+    });
 
     m_playback_manager->on_buffered_ranges_change = GC::weak_callback(*this, [](auto& self) {
         self.queue_a_media_element_task(GC::create_function(GC::Heap::the(), [](HTMLMediaElement& self) {
             self.maybe_complete_remote_fetch();
             self.update_ready_state();
         }));
+    });
+
+    m_playback_manager->on_seekable_ranges_change = GC::weak_callback(*this, [](auto& self) {
+        if (self.m_controls.has_value())
+            self.m_controls->seekable_ranges_changed();
     });
 }
 
@@ -2568,12 +2612,20 @@ void HTMLMediaElement::set_up_playback_manager_for_local(GC::Ref<GC::Function<vo
     m_playback_manager->on_playback_state_change = GC::weak_callback(*this, [](auto& self) {
         self.on_playback_manager_state_change();
     });
+    m_playback_manager->on_playback_state_settled_change = GC::weak_callback(*this, [](auto& self) {
+        self.update_pending_activity();
+    });
 
     m_playback_manager->on_buffered_ranges_change = GC::weak_callback(*this, [](auto& self) {
         self.queue_a_media_element_task(GC::create_function(GC::Heap::the(), [](HTMLMediaElement& self) {
             self.process_media_data(FetchingStatus::Ongoing);
             self.update_ready_state();
         }));
+    });
+
+    m_playback_manager->on_seekable_ranges_change = GC::weak_callback(*this, [](auto& self) {
+        if (self.m_controls.has_value())
+            self.m_controls->seekable_ranges_changed();
     });
 }
 
@@ -2756,14 +2808,17 @@ void HTMLMediaElement::forget_media_resource_specific_tracks()
     // of text tracks all the media-resource-specific text tracks, then empty the media element's audioTracks attribute's AudioTrackList object, then
     // empty the media element's videoTracks attribute's VideoTrackList object. No events (in particular, no removetrack events) are fired as part of
     // this; the error and emptied events, fired by the algorithms that invoke this one, can be used instead.
-    if (m_playback_manager)
+    if (m_playback_manager) {
         m_playback_manager->on_playback_state_change = nullptr;
+        m_playback_manager->on_playback_state_settled_change = nullptr;
+    }
     release_active_video_sink();
     m_media_data_is_cors_cross_origin = false;
     m_audio_tracks->remove_all_tracks();
     m_video_tracks->remove_all_tracks();
     update_audio_play_state();
     m_playback_manager.clear();
+    update_pending_activity();
     if (m_media_stream_playback) {
         m_media_stream_playback->set_tracks({});
         m_media_stream_playback.clear();
@@ -3281,6 +3336,8 @@ void HTMLMediaElement::seek_element(double playback_position, MediaSeekMode seek
             } else {
                 new_playback_position = other_nearest_point.value();
             }
+        } else {
+            new_playback_position = nearest_point;
         }
     }
 
@@ -3594,6 +3651,10 @@ bool HTMLMediaElement::should_be_kept_alive() const
     // NB: After an error, only a new load can fire further events or play, and that needs a reference to the element.
     if (error())
         return false;
+
+    // NB: Data that has not yet made its way through the pipeline may still raise the readyState.
+    if (m_playback_manager && !m_playback_manager->playback_state_is_settled())
+        return true;
 
     if (seeking())
         return true;

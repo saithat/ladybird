@@ -351,8 +351,6 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     // NB: The toolbar is made before the rest of the window, so it learns of the session's downloads once it is all here.
     toolbar().update_downloads_button();
 
-    auto const& browser_options = Application::browser_options();
-
     // A restored window keeps the session row the store re-adopted for it.
     if (restored_session_window_id.has_value())
         m_session_window_id = restored_session_window_id;
@@ -470,7 +468,7 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
     if (m_current_tab)
         focus_widget_for_tab(*m_current_tab).setFocus();
 
-    if (browser_options.devtools_port.has_value())
+    if (Application::the().devtools_port().has_value())
         on_devtools_enabled();
 }
 
@@ -738,7 +736,7 @@ void BrowserWindow::rebuild_bookmarks_menu()
 
 void BrowserWindow::on_devtools_enabled()
 {
-    m_devtools_banner->set_port(Application::browser_options().devtools_port.value_or(0));
+    m_devtools_banner->set_port(*Application::the().devtools_port());
     m_devtools_banner->show();
 }
 
@@ -832,7 +830,7 @@ Tab& BrowserWindow::create_restored_tab(RestoredSessionTab const& restored, int 
             .session_tab_id = restored.tab_id,
             .url = restored.url,
             .title = entry.has_value() && entry->title.has_value() ? qstring_from_ak_string(*entry->title) : qstring_from_ak_string(restored.url.serialize()),
-            .favicon = entry.has_value() && entry->favicon_png.has_value() ? icon_from_png(entry->favicon_png->bytes(), TAB_ICON_SIZE) : QIcon {},
+            .favicon = entry.has_value() && entry->favicon_png.has_value() ? favicon_from_png(entry->favicon_png->bytes(), TAB_ICON_SIZE) : QIcon {},
         };
         auto* tab = new Tab(this, AK::move(deferred_tab));
         tab->set_pinned(restored.pinned);
@@ -1153,7 +1151,50 @@ void BrowserWindow::set_current_tab(Tab* tab)
             session().active_tab_changed(*session_tab_id);
     }
 
+    reposition_page_cards();
     Application::the().report_active_view();
+}
+
+void BrowserWindow::show_page_card(PageCardSlot slot, QString const& title, QString const& text, Vector<PageCard::Button> buttons)
+{
+    auto& card = m_page_cards[to_underlying(slot)];
+    if (card)
+        card->deleteLater();
+    card = new PageCard(*m_tabs_container, title, text, AK::move(buttons));
+    QObject::connect(card, &QObject::destroyed, this, [this] {
+        QTimer::singleShot(0, this, [this] { reposition_page_cards(); });
+    });
+    if (m_page_cards_view)
+        m_page_cards_view->add_floating_surface(*card);
+    card->show();
+    // The shadow of a card follows where the card moves while it is shown, so the card only moves once it is.
+    reposition_page_cards();
+}
+
+// The cards stack from the top of the page down, in the order of their slots.
+void BrowserWindow::reposition_page_cards()
+{
+    static constexpr int CARD_SPACING = 10;
+
+    // The cards float over the page of the current tab alone.
+    auto* view = m_current_tab ? &m_current_tab->view() : nullptr;
+    if (m_page_cards_view != view) {
+        for (auto& card : m_page_cards) {
+            if (card && m_page_cards_view)
+                m_page_cards_view->remove_floating_surface(*card);
+            if (card && view)
+                view->add_floating_surface(*card);
+        }
+        m_page_cards_view = view;
+    }
+
+    int top_offset = 0;
+    for (auto& card : m_page_cards) {
+        if (!card || !view)
+            continue;
+        card->reposition(*view, top_offset);
+        top_offset += card->height() + CARD_SPACING;
+    }
 }
 
 void BrowserWindow::activate_tab(int index)
@@ -1454,11 +1495,14 @@ void BrowserWindow::create_menu_bar_window_controls()
 void BrowserWindow::update_menu_bar_visibility()
 {
     auto show_menu_bar = show_menu_bar_option_available() && Application::settings().appearance().show_menu_bar;
-    menuBar()->setVisible(show_menu_bar);
 
+    // Update the controls first so the menu bar measures its corner widgets with the controls visible when shown.
     if (m_menu_bar_window_controls)
         m_menu_bar_window_controls->setVisible(show_menu_bar && uses_client_side_decorations());
-    // NB: A full-screen window has no window controls of its own on display, so the chrome leaves no room for them.
+
+    menuBar()->setVisible(show_menu_bar);
+
+    // A full-screen window has no window controls of its own on display, so the chrome leaves no room for them.
     m_tabs_container->set_window_controls_visible(!show_menu_bar && has_chrome_in_titlebar() && !isFullScreen());
 }
 

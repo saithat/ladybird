@@ -11,7 +11,9 @@
 #include <AK/Platform.h>
 #include <Hub/Application.h>
 #include <Hub/ConnectionFromUI.h>
+#include <LibCore/Forward.h>
 #include <LibCore/Platform/ProcessStatistics.h>
+#include <LibCore/Process.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebView/Application.h>
@@ -19,6 +21,7 @@
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/CrashReportOutbox.h>
 #include <LibWebView/ProcessSnapshot.h>
+#include <LibWebView/UpdateCheck.h>
 #include <UI/Qt/ApplicationActions.h>
 #include <UI/Qt/BrowserWindow.h>
 #include <UI/Qt/HubConnection.h>
@@ -82,6 +85,8 @@ public:
     static Hub::Application& hub() { return Hub::Application::the(); }
     static WebView::BrowserOptions const& browser_options() { return WebView::Application::browser_options(); }
 #endif
+
+    Optional<u16> devtools_port() const { return m_devtools_port; }
     bool has_translator() const;
     WebView::MicrophoneAuthorizer* microphone_authorizer() { return m_microphone_authorizer.ptr(); }
     // The status to exit with right away, if the browser has nothing for this process to do.
@@ -142,6 +147,17 @@ public:
     // the downloads and quits; if a page refuses or the downloads are kept, the quit is canceled and no window closes.
     void quit();
     bool is_quit_in_progress() const { return m_quit_in_progress; }
+    struct RestartCommand {
+        ByteString executable;
+        Vector<ByteString> arguments;
+        Optional<Core::Process> hub;
+        bool relaunched_by_updater { false };
+
+        ErrorOr<void> run();
+    };
+    void offer_restart_after_update();
+    void restart();
+    Optional<RestartCommand> take_restart_command();
     bool is_finishing_quit() const { return m_quit_is_finishing; }
     bool confirm_stop_active_downloads(QWidget* parent = nullptr);
 
@@ -256,6 +272,7 @@ private:
     void ask_user_for_download_path(u64 request_id, ByteString const& file) const;
     void display_download_confirmation_dialog(StringView download_name, ByteString const& path) const;
     void display_error_dialog(StringView error_message) const;
+    void display_update_check_result(WebView::UpdateCheckResult::Kind, Optional<String> const& version, WebView::InstallMethod, WebView::UpdateCheckTrigger);
     void open_file(String const& path) const;
 
     virtual void crash_reports_changed() override;
@@ -292,8 +309,8 @@ private:
     NonnullRefPtr<BookmarkPromise> display_add_bookmark_folder_dialog(Optional<String const&> default_title = {}, Optional<String const&> target_folder_id = {}) const;
     NonnullRefPtr<BookmarkPromise> display_edit_bookmark_folder_dialog(BookmarkItem const& current_folder, Optional<String const&> parent_folder_id) const;
 
-    void did_enable_devtools() const;
-    void did_disable_devtools() const;
+    void did_enable_devtools(u16 port);
+    void did_disable_devtools();
     void on_recently_closed_entries_changed() const;
     void did_clear_history_since(UnixDateTime);
     void create_session_store(ByteString const& data_directory, bool persists_sessions);
@@ -303,6 +320,7 @@ private:
     static Application* s_the;
 
     String m_command_line;
+    Optional<u16> m_devtools_port;
 
 #ifdef LADYBIRD_HUB_IN_OWN_PROCESS
     ErrorOr<void> connect_to_hub(Main::Arguments const&);
@@ -360,6 +378,20 @@ private:
     bool m_quit_in_progress { false };
     bool m_quit_is_finishing { false };
     Vector<QPointer<BrowserWindow>> m_windows_awaiting_quit_preflight;
+
+#if defined(AK_OS_LINUX)
+    void watch_for_replaced_installation();
+    RefPtr<Core::FileWatcher> m_installation_watcher;
+#endif
+    enum class Restart : u8 {
+        None,
+        ByLadybird,
+        ByUpdater,
+    };
+    Restart m_restart { Restart::None };
+    bool m_installation_replaced { false };
+    bool m_profile_is_temporary { false };
+    RestartCommand m_restart_command;
 };
 
 }

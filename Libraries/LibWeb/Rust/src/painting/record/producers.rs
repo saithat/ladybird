@@ -21,6 +21,7 @@ use crate::painting::force_dark::ForceDarkRole;
 use crate::painting::paint_order_plan::{PaintOrderItem, PaintProducer, PaintScope, PaintScopePlan};
 use crate::painting::paint_read::{GeometryRead, PaintRead, PaintSource};
 use crate::painting::record::change_ticks::RowChanges;
+use crate::painting::record::paint::background_resolution::root_paint_covers_canvas;
 use crate::painting::record::svg_resources::MaskLayerSet;
 use crate::painting::{node_painting, paintable_geometry};
 use libgfx_rust::Color;
@@ -81,11 +82,18 @@ impl<O: Observer> PaintRecorder<'_, O> {
                 );
                 root_group_color = canvas_color;
             }
-            this.recorder.fill_rect(
-                inputs.bitmap_rect,
-                inputs.uncaptured.background_color,
-                ForceDarkRole::Background,
-            );
+            // The root element paints its background over the canvas as well, wherever its own paint covers the canvas.
+            // So there, fill with it only when it's opaque, since painting it twice changes nothing: A translucent one
+            // would otherwise be applied twice.
+            if inputs.uncaptured.background_color.alpha() == 255
+                || !root_paint_covers_canvas(this.source, inputs.uncaptured.root_background_source.root_layout_node)
+            {
+                this.recorder.fill_rect(
+                    inputs.bitmap_rect,
+                    inputs.uncaptured.background_color,
+                    ForceDarkRole::Background,
+                );
+            }
             root_group_color = root_group_color.blend(
                 this.recorder
                     .resolve_color(inputs.uncaptured.background_color, ForceDarkRole::Background),
@@ -179,6 +187,8 @@ impl<O: Observer> AssemblyHost for PaintRecorder<'_, O> {
         }
         self.live_producer = false;
         self.producer_reads_window_focus.set(false);
+        self.recorder
+            .begin_record_origin(owner, super::trace::producer_name(kind));
         let start = self.recorder.byte_size();
         let blocking_wheel_event_regions_before = self.blocking_wheel_event_region_count;
         self.observer
@@ -209,6 +219,7 @@ impl<O: Observer> AssemblyHost for PaintRecorder<'_, O> {
             }
         }
         let end = self.recorder.byte_size();
+        self.recorder.end_record_origin();
         if self.ink_bounds_audit.enabled {
             self.verify_producer_ink(owner, kind, start..end);
             self.verify_producer_against_open_scopes(owner, kind, start..end);
@@ -227,8 +238,16 @@ impl<O: Observer> AssemblyHost for PaintRecorder<'_, O> {
 
     fn take_run_chunk(&mut self) -> Option<Arc<RecordedChunk>> {
         let chunk = self.recorder.take_chunk();
+        let record_notes = self.recorder.take_record_notes();
         let draws_vector_image_placeholders = std::mem::take(&mut self.run_draws_vector_image_placeholders);
-        (!chunk.records.is_empty()).then(|| RecordedChunk::new(chunk, draws_vector_image_placeholders))
+        if chunk.records.is_empty() {
+            return None;
+        }
+        let chunk = RecordedChunk::new(chunk, draws_vector_image_placeholders);
+        if let Some(record_notes) = record_notes {
+            self.record_notes_of_chunks.push((Arc::clone(&chunk), record_notes));
+        }
+        Some(chunk)
     }
 
     fn changes_of_row(&mut self, row: NodeSlotId) -> RowChanges {

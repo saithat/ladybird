@@ -4,12 +4,9 @@ set(SOURCES
     KeyHandle.cpp
     OpenSSL.cpp
     RustBindings.cpp
-    ASN1/ASN1.cpp
     ASN1/DER.cpp
     Authentication/HMAC.cpp
     Authentication/KMAC.cpp
-    BigInt/UnsignedBigInteger.cpp
-    Certificate/Certificate.cpp
     Cipher/AES.cpp
     Cipher/ChaCha.cpp
     Curves/EdwardsCurve.cpp
@@ -19,6 +16,7 @@ set(SOURCES
     Hash/HKDF.cpp
     Hash/PBKDF2.cpp
     PK/EC.cpp
+    PK/KeyInfo.cpp
     PK/MLDSA.cpp
     PK/MLKEM.cpp
     PK/ModuleLatticePrivateKey.cpp
@@ -28,5 +26,4 @@ set(SOURCES
 
 ladybird_lib(LibCrypto crypto)
 
-target_link_libraries(LibCrypto PRIVATE PkgConfig::libtommath)
 target_link_libraries(LibCrypto PUBLIC OpenSSL::Crypto)

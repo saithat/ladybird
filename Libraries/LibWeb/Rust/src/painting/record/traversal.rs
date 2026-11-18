@@ -11,7 +11,7 @@ use crate::layout::node_data::NodeSlotId;
 use crate::painting::display_list::builder::RecordedDisplayList;
 use crate::painting::display_list::commands::ContextRef;
 use crate::painting::display_list::device_pixels::DevicePixelConverter;
-use crate::painting::display_list::recorder::DisplayListRecorder;
+use crate::painting::display_list::recorder::{DisplayListRecorder, RecordNotes};
 use crate::painting::node_painting;
 use crate::painting::paint_order_plan::PaintScope;
 use crate::painting::paint_read::{GeometryRead, PaintSource};
@@ -132,7 +132,11 @@ fn record_display_list_impl<O: Observer>(
         scratch,
         resources: RecordingResourceManifest::default(),
         window_spaces,
+        record_notes_of_chunks: Vec::new(),
     };
+    if inputs.notes_record_origins {
+        recorder.recorder.note_record_origins();
+    }
     let root_group_color = recorder.record_canvas();
     let prologue = recorder.take_run_chunk();
     let prologue_id = prologue.as_ref().map(|chunk| chunk.recorded().id);
@@ -205,6 +209,10 @@ fn record_display_list_impl<O: Observer>(
         Some(root) => root.facts.blocking_wheel_event_regions > 0,
         None => recorder.blocking_wheel_event_region_count > 0,
     };
+    let record_notes = recorder
+        .recorder
+        .notes_record_origins()
+        .then(|| Arc::new(record_notes_of_tape(&chunks, &mut recorder.record_notes_of_chunks)));
     let output = RecordingOutput {
         recorded_structural_epoch: structural_epoch,
         recorded_as_of: source.frame().paint_generation(),
@@ -228,6 +236,7 @@ fn record_display_list_impl<O: Observer>(
         display_list_id: 0,
         surface_clear_color: None,
         async_scrolling_metadata: None,
+        record_notes,
     };
     let resources = recorder.resources;
     let mut record_from_scratch = |window: Option<Arc<RecordedWindow>>| {
@@ -255,6 +264,33 @@ fn record_display_list_impl<O: Observer>(
     RecordingResult { output, resources }
 }
 
+/// The notes of the chunks of a tape, by the offsets of their records in it. A chunk the recording copied has none.
+fn record_notes_of_tape(
+    chunks: &[Arc<RecordedChunk>],
+    record_notes_of_chunks: &mut Vec<(Arc<RecordedChunk>, RecordNotes)>,
+) -> RecordNotes {
+    let mut notes = RecordNotes::default();
+    let mut chunk_start = 0;
+    for chunk in chunks {
+        let chunk_size = chunk.latest().records.len();
+        if chunk_size == 0 {
+            continue;
+        }
+        if let Some(index) = record_notes_of_chunks
+            .iter()
+            .position(|(noted_chunk, _)| Arc::ptr_eq(noted_chunk, chunk))
+        {
+            let (_, chunk_notes) = record_notes_of_chunks.swap_remove(index);
+            notes.append_shifted_by(
+                chunk_notes,
+                u32::try_from(chunk_start).expect("display list exceeds u32"),
+            );
+        }
+        chunk_start += chunk_size;
+    }
+    notes
+}
+
 fn left_out_content_is_verified() -> bool {
     static VERIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VERIFIED.get_or_init(|| cfg!(debug_assertions) || std::env::var_os("LIBWEB_VERIFY_PAINT_WINDOW").is_some())
@@ -268,7 +304,7 @@ fn require_only_what_misses_the_window_is_left_out(
     of_whole_document: &RecordingOutput,
     spaces: &WindowSpaces<'_>,
 ) {
-    use crate::painting::display_list::builder::for_each_command;
+    use crate::painting::display_list::builder::{bounding_rect_computed_from_payload, for_each_command};
     use crate::painting::display_list::chunks::chunks_of;
     let (windowed, whole) = (&of_window.display_list, &of_whole_document.display_list);
     let mut chunks_of_window = chunks_of(&windowed.bytes, &windowed.command_runs, &windowed.chunks).peekable();
@@ -288,15 +324,18 @@ fn require_only_what_misses_the_window_is_left_out(
         for run in runs {
             let run_start = (run.offset - chunk_start) as usize;
             let run_bytes = &bytes[run_start..run_start + run.size as usize];
-            for_each_command(run_bytes, |header, _, _| {
-                if header.command_type.is_compositor_metadata() || !header.has_bounding_rect {
+            for_each_command(run_bytes, |header, _, payload| {
+                if header.command_type.is_compositor_metadata() {
                     return;
                 }
+                let Some(bounding_rect) = bounding_rect_computed_from_payload(header, payload) else {
+                    return;
+                };
                 assert!(
-                    spaces.shows_in_window(header.bounding_rect.to_float(), run.context) != Some(true),
+                    spaces.shows_in_window(bounding_rect.to_float(), run.context) != Some(true),
                     "A recording of a window left out {} at {:?} under {:?}, which shows in the window",
                     header.command_type.name(),
-                    header.bounding_rect,
+                    bounding_rect,
                     run.context
                 );
             });
@@ -339,7 +378,7 @@ fn reused_output_is_verified() -> bool {
 /// Requires a recording that reused clean output of the published one to be the recording the same frame gives when
 /// everything is recorded: a difference is output that was reused though what it shows changed.
 fn require_same_recording(assembled: &RecordingOutput, from_scratch: &RecordingOutput) {
-    use crate::painting::display_list::builder::for_each_command;
+    use crate::painting::display_list::builder::{bounding_rect_computed_from_payload, for_each_command};
     use crate::painting::display_list::chunks::{chunk_id, chunks_of};
     let (assembled_list, scratch_list) = (&assembled.display_list, &from_scratch.display_list);
     let assembled_bytes = without_vector_image_ids(&assembled_list.bytes);
@@ -352,9 +391,13 @@ fn require_same_recording(assembled: &RecordingOutput, from_scratch: &RecordingO
             .unwrap_or(assembled_bytes.len().min(scratch_bytes.len()));
         let command_at = |bytes: &[u8]| {
             let mut found = None;
-            for_each_command(bytes, |header, offset, _| {
+            for_each_command(bytes, |header, offset, payload| {
                 if offset <= first_differing_byte {
-                    found = Some((offset, header.command_type.name(), header.bounding_rect));
+                    found = Some((
+                        offset,
+                        header.command_type.name(),
+                        bounding_rect_computed_from_payload(header, payload),
+                    ));
                 }
             });
             found

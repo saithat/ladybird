@@ -6,7 +6,7 @@
 
 #include <AK/Base64.h>
 #include <LibCrypto/ASN1/Constants.h>
-#include <LibCrypto/Certificate/Certificate.h>
+#include <LibCrypto/PK/KeyInfo.h>
 #include <LibTest/TestCase.h>
 
 TEST_CASE(test_ed25519_private_key_length)
@@ -15,8 +15,8 @@ TEST_CASE(test_ed25519_private_key_length)
         0x30, 0x0e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
         0x03, 0x2b, 0x65, 0x70, 0x04, 0x02, 0x04, 0x00
     };
-    Crypto::ASN1::Decoder invalid_key_decoder(invalid_key_der);
-    EXPECT(Crypto::Certificate::parse_private_key_info(invalid_key_decoder).is_error());
+    size_t consumed = 0;
+    EXPECT(Crypto::PK::parse_private_key_info(invalid_key_der, consumed).is_error());
 
     constexpr Array<u8, 48> valid_key_der {
         0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
@@ -26,8 +26,7 @@ TEST_CASE(test_ed25519_private_key_length)
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
-    Crypto::ASN1::Decoder valid_key_decoder(valid_key_der);
-    EXPECT(!Crypto::Certificate::parse_private_key_info(valid_key_decoder).is_error());
+    EXPECT(!Crypto::PK::parse_private_key_info(valid_key_der, consumed).is_error());
 }
 
 TEST_CASE(test_private_key_info_decode)
@@ -45,14 +44,22 @@ TEST_CASE(test_private_key_info_decode)
 
     auto decoded_keyder = TRY_OR_FAIL(decode_base64(keyder));
 
-    Crypto::ASN1::Decoder decoder(decoded_keyder);
-    auto private_key_info = TRY_OR_FAIL(Crypto::Certificate::parse_private_key_info(decoder));
+    size_t consumed = 0;
+    auto private_key_info = TRY_OR_FAIL(Crypto::PK::parse_private_key_info(decoded_keyder, consumed));
 
     EXPECT_EQ(private_key_info.algorithm.identifier, Crypto::ASN1::rsa_encryption_oid);
     auto& key = private_key_info.rsa;
+    using Component = Crypto::PK::RSAPrivateKey::Component;
+    // NB: A component has no leading zero bytes, which `openssl rsa -text` prints before a top bit that is set.
+    auto expect_component = [&](Component component, ReadonlyBytes expected) {
+        auto bytes = MUST(key.component(component));
+        while (!expected.is_empty() && expected[0] == 0)
+            expected = expected.slice(1);
+        EXPECT_EQ(bytes.bytes(), expected);
+    };
 
-    EXPECT_EQ(key.length() * 8, 512u);
-    EXPECT_EQ(key.public_exponent(), 65537);
+    u8 const public_exponent[] = { 0x01, 0x00, 0x01 };
+    expect_component(Component::PublicExponent, public_exponent);
 
     // $ openssl rsa -in testcase.pem -text
 
@@ -63,7 +70,7 @@ TEST_CASE(test_private_key_info_decode)
         0x63, 0x2a, 0x21, 0x56, 0x3e, 0x81, 0xf1, 0x67, 0xe7, 0xe8, 0x47, 0x1a, 0xcb, 0xbf, 0x87,
         0x7d, 0xb1, 0x5f, 0xc4, 0x4f
     };
-    EXPECT_EQ(key.modulus(), Crypto::UnsignedBigInteger(modulus));
+    expect_component(Component::Modulus, modulus);
 
     u8 const private_exponent[] = {
         0x69, 0x0b, 0x7e, 0xd4, 0x26, 0x48, 0xd6, 0x41, 0x11, 0xf2, 0xc4, 0xff, 0x37, 0xc6, 0xe6,
@@ -72,40 +79,40 @@ TEST_CASE(test_private_key_info_decode)
         0x25, 0xbb, 0x8a, 0xb1, 0xe3, 0xcf, 0xdf, 0x62, 0xdf, 0x02, 0xbf, 0xac, 0xfa, 0x26, 0xe4,
         0x34, 0x65, 0x01, 0x31
     };
-    EXPECT_EQ(key.private_exponent(), Crypto::UnsignedBigInteger(private_exponent));
+    expect_component(Component::PrivateExponent, private_exponent);
 
     u8 const prime1[] = {
         0x00, 0xf5, 0x74, 0x59, 0x55, 0x49, 0xc2, 0x27, 0x6c, 0x4e, 0x70, 0x21, 0x42, 0x6f, 0x22,
         0x05, 0xf9, 0xdd, 0xc5, 0xf4, 0xa8, 0x6d, 0xe6, 0xb4, 0x7b, 0xec, 0x5f, 0x4a, 0xb1, 0x19,
         0x60, 0x51, 0xb9
     };
-    EXPECT_EQ(key.prime1(), Crypto::UnsignedBigInteger(prime1));
+    expect_component(Component::Prime1, prime1);
 
     u8 const prime2[] = {
         0x00, 0xee, 0x43, 0xb6, 0x33, 0x2e, 0x94, 0x3c, 0x57, 0xc0, 0x49, 0xc0, 0xa6, 0xc3, 0x79,
         0x7c, 0x35, 0xbd, 0x0b, 0xdc, 0x3c, 0x49, 0xf2, 0x2a, 0x74, 0xce, 0xa0, 0x02, 0xe9, 0x17,
         0xa6, 0xea, 0x47
     };
-    EXPECT_EQ(key.prime2(), Crypto::UnsignedBigInteger(prime2));
+    expect_component(Component::Prime2, prime2);
 
     u8 const exponent1[] = {
         0x00, 0x80, 0xd2, 0x9b, 0xc0, 0x23, 0x81, 0xfe, 0xe6, 0xdd, 0x14, 0x04, 0xa0, 0xb5, 0x6b,
         0x09, 0xef, 0xe5, 0xf1, 0x6b, 0x42, 0xaa, 0xcb, 0x96, 0x96, 0x23, 0xac, 0xaf, 0xaa, 0xdb,
         0x42, 0xae, 0x21
     };
-    EXPECT_EQ(key.exponent1(), Crypto::UnsignedBigInteger(exponent1));
+    expect_component(Component::Exponent1, exponent1);
 
     u8 const exponent2[] = {
         0x00, 0xc7, 0xc4, 0x75, 0xeb, 0x0b, 0xce, 0xb5, 0x99, 0x4d, 0x5b, 0x88, 0xef, 0x49, 0x4d,
         0x7e, 0x5b, 0x00, 0x1a, 0x05, 0x99, 0x76, 0xd6, 0x57, 0xca, 0x7f, 0xc3, 0xa1, 0x2d, 0x15,
         0xeb, 0x98, 0xd9
     };
-    EXPECT_EQ(key.exponent2(), Crypto::UnsignedBigInteger(exponent2));
+    expect_component(Component::Exponent2, exponent2);
 
     u8 const coefficient[] = {
         0x6f, 0x48, 0x45, 0xd7, 0x12, 0x88, 0xd4, 0x7f, 0x52, 0xdf, 0x10, 0x7c, 0x3d, 0xcd, 0xf4,
         0x16, 0xf5, 0x1e, 0xc5, 0x26, 0xf8, 0x1b, 0xf3, 0x73, 0xcc, 0x86, 0xce, 0x5f, 0x3d, 0xa5,
         0x84, 0x93
     };
-    EXPECT_EQ(key.coefficient(), Crypto::UnsignedBigInteger(coefficient));
+    expect_component(Component::Coefficient, coefficient);
 }

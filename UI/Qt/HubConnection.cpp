@@ -311,9 +311,9 @@ void HubConnection::app_quit_for_signal()
     Application::the().quit_for_signal();
 }
 
-void HubConnection::app_did_enable_devtools()
+void HubConnection::app_did_enable_devtools(u16 port)
 {
-    Application::the().did_enable_devtools();
+    Application::the().did_enable_devtools(port);
 }
 
 void HubConnection::app_did_disable_devtools()
@@ -339,6 +339,11 @@ void HubConnection::app_open_view_in_new_tab(u64 view_id, Optional<u64> source_v
 void HubConnection::app_display_error_dialog(String message)
 {
     Application::the().display_error_dialog(message);
+}
+
+void HubConnection::app_display_update_check_result(WebView::UpdateCheckResult::Kind kind, Optional<String> version, WebView::InstallMethod install_method, WebView::UpdateCheckTrigger trigger)
+{
+    Application::the().display_update_check_result(kind, version, install_method, trigger);
 }
 
 void HubConnection::app_display_download_confirmation_dialog(String download_name, ByteString path)

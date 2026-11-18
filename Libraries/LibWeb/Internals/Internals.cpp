@@ -443,6 +443,11 @@ WebIDL::ExceptionOr<void> Internals::mark_as_garbage(Utf16String const& variable
     TRY(environment->set_mutable_binding(vm, variable_name_fly, JS::js_undefined(), false));
     (void)TRY(environment->delete_binding(vm, variable_name_fly));
     vm.heap().uproot_cell(&value.as_cell());
+    // A wrapper's wrappable is a cell of its own, so a stale stack word that points at it could still keep it alive.
+    if (value.is_object()) {
+        if (auto* platform_object = Bindings::as_platform_object(value.as_object()); platform_object && platform_object->wrappable())
+            vm.heap().uproot_cell(platform_object->wrappable().ptr());
+    }
     return {};
 }
 
@@ -1914,9 +1919,29 @@ static Utf16String dump_string_to_utf16(String const& string)
     return Utf16String::from_utf8_without_validation(string.bytes_as_string_view());
 }
 
-Utf16String Internals::dump_display_list()
+Utf16String Internals::dump_display_list(Bindings::DisplayListDumpOptions const& options)
 {
-    return window().associated_document().dump_display_list();
+    return window().associated_document().dump_display_list({
+        .owners = options.owners,
+        .text = options.text,
+        .fonts = options.fonts,
+        .record_ids = options.record_ids,
+        .chunks = options.chunks,
+        .raw_node_indices = options.raw_node_indices,
+        .jsonl = options.format == Bindings::DisplayListDumpFormat::Jsonl,
+    });
+}
+
+Utf16String Internals::dump_display_list_changes(Bindings::DisplayListDumpOptions const& options)
+{
+    auto& document = window().associated_document();
+    auto jsonl = document.dump_display_list({ .raw_node_indices = options.raw_node_indices, .jsonl = true }).to_utf8();
+    Optional<StringView> previous_jsonl;
+    if (m_display_list_dump_for_changes.has_value() && m_display_list_dump_for_changes->document_id == document.unique_id())
+        previous_jsonl = m_display_list_dump_for_changes->jsonl;
+    auto changes = Painting::display_list_dump_changes(previous_jsonl, jsonl);
+    m_display_list_dump_for_changes = DisplayListDumpForChanges { document.unique_id(), move(jsonl) };
+    return changes;
 }
 
 Utf16String Internals::dump_accessibility_tree()

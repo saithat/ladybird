@@ -35,7 +35,6 @@
 #include <UI/Qt/Motion.h>
 #include <UI/Qt/PermissionPromptPopover.h>
 #include <UI/Qt/Popover.h>
-#include <UI/Qt/RestoreSessionCard.h>
 #include <UI/Qt/SiteSettingsPopover.h>
 #include <UI/Qt/StringUtils.h>
 #include <UI/Qt/SystemAppearance.h>
@@ -101,7 +100,6 @@ static QIcon calendar_month_chevron_icon(QWidget const& widget, ChevronDirection
     return QIcon(pixmap);
 }
 
-static constexpr int TAB_FAVICON_SIZE = 16;
 static constexpr int PRIVATE_SESSION_POPOVER_WIDTH = 320;
 
 // The page's zoom, with buttons to change it and a way back to the default.
@@ -188,7 +186,7 @@ Tab::Tab(BrowserWindow* window, DeferredTab deferred_tab)
     , WebView::SettingsObserver(Application::settings())
     , m_window(window)
     , m_title(deferred_tab.title)
-    , m_favicon(favicon_with_rounded_corners(deferred_tab.favicon, TAB_FAVICON_SIZE))
+    , m_favicon(deferred_tab.favicon)
     , m_session_tab_id(deferred_tab.session_tab_id)
     , m_deferred_tab(AK::move(deferred_tab))
 {
@@ -1412,8 +1410,7 @@ bool Tab::eventFilter(QObject* watched, QEvent* event)
     if (watched == m_view && (event->type() == QEvent::Resize || event->type() == QEvent::Move)) {
         if (m_find_in_page->isVisible())
             m_find_in_page->reposition();
-        if (m_restore_session_card)
-            m_restore_session_card->reposition();
+        m_window->reposition_page_cards();
     }
     if (watched == m_location_edit && event->type() == QEvent::DynamicPropertyChange && static_cast<QDynamicPropertyChangeEvent*>(event)->propertyName() == "autocompleteOpen")
         m_view->set_suggestions_over_page(m_location_edit->property("autocompleteOpen").toBool());
@@ -1448,8 +1445,10 @@ void Tab::recreate_location_edit_icons()
 
 void Tab::show_translation_menu()
 {
-    if (!m_translation_menu)
+    if (!m_translation_menu) {
         m_translation_menu = create_application_menu(*this, view().translation_menu());
+        m_location_edit->follow_translation_menu(*m_translation_menu);
+    }
     auto& button = m_location_edit->translate_button();
     m_translation_menu->popup(button.mapToGlobal(QPoint { 0, button.height() }));
 }
@@ -1501,6 +1500,7 @@ void Tab::show_bookmark_popover()
         m_bookmark_popover->on_remove = [this](Function<void()> const& remove) {
             m_location_edit->animate_trailing_action_change(LocationEdit::TrailingActionMotion::Fade, remove);
         };
+        m_location_edit->follow_bookmark_popover(*m_bookmark_popover);
     }
     m_bookmark_popover->update_chrome_style(palette());
     m_bookmark_popover->set_bookmark(bookmark->id, just_added);
@@ -1639,16 +1639,6 @@ void Tab::position_private_session_popover()
     m_private_session_popover->adjustSize();
 
     move_popover_below(*m_private_session_popover, m_window->ladybird_button(), PopoverAlignment::Leading, m_window->ladybird_button().tile_rect());
-}
-
-void Tab::show_restore_session_card(size_t tab_count, Function<void()> on_restore)
-{
-    if (m_restore_session_card)
-        m_restore_session_card->deleteLater();
-    m_restore_session_card = new RestoreSessionCard(*this, *m_view, tab_count);
-    m_view->add_floating_surface(*m_restore_session_card);
-    m_restore_session_card->on_restore = AK::move(on_restore);
-    m_restore_session_card->show();
 }
 
 void Tab::show_find_in_page()

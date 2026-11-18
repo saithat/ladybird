@@ -8,14 +8,17 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AnyOf.h>
+#include <AK/Array.h>
 #include <AK/Memory.h>
 #include <AK/Random.h>
+#include <AK/ScopeGuard.h>
+#include <AK/Utf16String.h>
 #include <LibCrypto/ASN1/ASN1.h>
 #include <LibCrypto/ASN1/Constants.h>
 #include <LibCrypto/ASN1/DER.h>
 #include <LibCrypto/Authentication/HMAC.h>
 #include <LibCrypto/Authentication/KMAC.h>
-#include <LibCrypto/Certificate/Certificate.h>
 #include <LibCrypto/Cipher/AES.h>
 #include <LibCrypto/Cipher/ChaCha.h>
 #include <LibCrypto/Curves/EdwardsCurve.h>
@@ -26,8 +29,10 @@
 #include <LibCrypto/Hash/SHAKE.h>
 #include <LibCrypto/KeyHandle.h>
 #include <LibCrypto/PK/EC.h>
+#include <LibCrypto/PK/KeyInfo.h>
 #include <LibCrypto/PK/MLDSA.h>
 #include <LibCrypto/PK/MLKEM.h>
+#include <LibCrypto/PK/PK.h>
 #include <LibCrypto/PK/RSA.h>
 
 namespace Crypto {
@@ -39,9 +44,9 @@ struct Asn1Storage final {
     T value;
 };
 
-using SubjectPublicKeyStorage = Asn1Storage<Certificate::SubjectPublicKey>;
-using PrivateKeyStorage = Asn1Storage<Certificate::PrivateKey>;
-using OctetStringStorage = Asn1Storage<StringView>;
+using SubjectPublicKeyStorage = Asn1Storage<PK::SubjectPublicKeyInfo>;
+using PrivateKeyStorage = Asn1Storage<PK::PrivateKeyInfo>;
+using OctetStringStorage = Asn1Storage<ReadonlyBytes>;
 
 extern "C" {
 using ReceiveEncodedBytes = void (*)(void*, ReadonlyBytes);
@@ -63,31 +68,31 @@ static bool receive_byte_result(ErrorOr<ByteBuffer> const& result, void* state, 
 
 FlatPtr crypto_decode_asn1_structure(ReadonlyBytes data, Asn1Structure structure, void* out, bool* all_consumed)
 {
-    ::Crypto::ASN1::Decoder decoder(data);
+    size_t consumed = 0;
     switch (structure) {
     case Asn1Structure::SubjectPublicKeyInfo: {
-        auto subject_public_key = ::Crypto::Certificate::parse_subject_public_key_info(decoder);
+        auto subject_public_key = ::Crypto::PK::parse_subject_public_key_info(data, consumed);
         if (subject_public_key.is_error())
             return Utf16String::formatted("{}", subject_public_key.release_error()).into_raw();
         static_cast<SubjectPublicKeyStorage*>(out)->value = subject_public_key.release_value();
         break;
     }
     case Asn1Structure::PrivateKeyInfo: {
-        auto private_key = ::Crypto::Certificate::parse_private_key_info(decoder);
+        auto private_key = ::Crypto::PK::parse_private_key_info(data, consumed);
         if (private_key.is_error())
             return Utf16String::formatted("{}", private_key.release_error()).into_raw();
         static_cast<PrivateKeyStorage*>(out)->value = private_key.release_value();
         break;
     }
     case Asn1Structure::OctetString: {
-        auto octet_string = decoder.read<StringView>(::Crypto::ASN1::Class::Universal, ::Crypto::ASN1::Kind::OctetString);
+        auto octet_string = ::Crypto::PK::parse_octet_string(data, consumed);
         if (octet_string.is_error())
             return Utf16String::formatted("{}", octet_string.error()).into_raw();
         static_cast<OctetStringStorage*>(out)->value = octet_string.release_value();
         break;
     }
     }
-    *all_consumed = decoder.eof();
+    *all_consumed = consumed == data.size();
     return 0;
 }
 
@@ -97,10 +102,8 @@ void crypto_asn1_delete_key_info(Asn1Structure, void*);
 bool crypto_rsa_key_info_has_encryption_oid(Asn1Structure, void const*);
 KeyHandle* crypto_rsa_key_info_read_key(Asn1Structure, void const*);
 bool crypto_rsa_key_is_valid(KeyHandle const*, bool*);
-bool crypto_rsa_validate_public_exponent(ReadonlyBytes, u32);
 bool crypto_rsa_validate_modulus_length(u32);
 bool crypto_rsa_generate_key_pair(u32, ReadonlyBytes, KeyHandle**, KeyHandle**);
-bool crypto_rsa_export_public_exponent(ReadonlyBytes, void*, ReceiveEncodedBytes);
 bool crypto_rsa_read_key_metadata(KeyHandle const*, u32*, void*, ReceiveEncodedBytes);
 KeyHandle* crypto_rsa_key_from_jwk_components(bool, ReadonlySpan<ReadonlyBytes>);
 bool crypto_rsa_export_der(KeyHandle const*, bool, void*, ReceiveEncodedBytes);
@@ -134,9 +137,6 @@ void crypto_asn1_delete_key_info(Asn1Structure structure, void* key_info)
     }
     VERIFY(structure == Asn1Structure::PrivateKeyInfo);
     auto* storage = static_cast<PrivateKeyStorage*>(key_info);
-    storage->value.rsa.clear_sensitive_data();
-    storage->value.mldsa.clear_sensitive_data();
-    storage->value.mlkem.clear_sensitive_data();
     secure_zero(storage->value.raw_key.data(), storage->value.raw_key.size());
     delete storage;
 }
@@ -169,14 +169,6 @@ bool crypto_rsa_key_is_valid(KeyHandle const* key, bool* valid)
     return true;
 }
 
-bool crypto_rsa_validate_public_exponent(ReadonlyBytes bytes, u32 modulus_length)
-{
-    auto public_exponent = ::Crypto::UnsignedBigInteger::import_data(bytes);
-    return public_exponent >= ::Crypto::UnsignedBigInteger { 3 }
-    && public_exponent.is_odd()
-        && public_exponent.plus(1).one_based_index_of_highest_set_bit() <= modulus_length;
-}
-
 bool crypto_rsa_validate_modulus_length(u32 modulus_length)
 {
     return !::Crypto::PK::RSA::validate_key_generation_parameters(modulus_length).is_error();
@@ -184,7 +176,7 @@ bool crypto_rsa_validate_modulus_length(u32 modulus_length)
 
 bool crypto_rsa_generate_key_pair(u32 modulus_length, ReadonlyBytes public_exponent, KeyHandle** out_public_key, KeyHandle** out_private_key)
 {
-    auto key_pair = ::Crypto::PK::RSA::generate_key_pair(modulus_length, ::Crypto::UnsignedBigInteger::import_data(public_exponent));
+    auto key_pair = ::Crypto::PK::RSA::generate_key_pair(modulus_length, public_exponent);
     if (key_pair.is_error())
         return false;
     *out_public_key = new KeyHandle(move(key_pair.value().public_key));
@@ -192,28 +184,16 @@ bool crypto_rsa_generate_key_pair(u32 modulus_length, ReadonlyBytes public_expon
     return true;
 }
 
-static ErrorOr<ByteBuffer> export_rsa_exponent(::Crypto::UnsignedBigInteger const& exponent)
-{
-    auto bytes = TRY(ByteBuffer::create_uninitialized(exponent.byte_length()));
-    return ByteBuffer::copy(exponent.export_data(bytes.span()));
-}
-
-bool crypto_rsa_export_public_exponent(ReadonlyBytes public_exponent, void* state, ReceiveEncodedBytes receive)
-{
-    auto bytes = export_rsa_exponent(::Crypto::UnsignedBigInteger::import_data(public_exponent));
-    return receive_byte_result(bytes, state, receive);
-}
-
 bool crypto_rsa_read_key_metadata(KeyHandle const* key, u32* modulus_length, void* state, ReceiveEncodedBytes receive)
 {
     auto result = key->visit(
         [&](::Crypto::PK::RSAPublicKey const& public_key) {
-            *modulus_length = public_key.modulus().byte_length() * 8;
-            return export_rsa_exponent(public_key.public_exponent());
+            *modulus_length = public_key.modulus_bits();
+            return public_key.public_exponent();
         },
         [&](::Crypto::PK::RSAPrivateKey const& private_key) {
-            *modulus_length = private_key.modulus().byte_length() * 8;
-            return export_rsa_exponent(private_key.public_exponent());
+            *modulus_length = private_key.modulus_bits();
+            return private_key.component(::Crypto::PK::RSAPrivateKey::Component::PublicExponent);
         },
         [](auto const&) -> ErrorOr<ByteBuffer> { VERIFY_NOT_REACHED(); });
     return receive_byte_result(result, state, receive);
@@ -221,21 +201,20 @@ bool crypto_rsa_read_key_metadata(KeyHandle const* key, u32* modulus_length, voi
 
 KeyHandle* crypto_rsa_key_from_jwk_components(bool is_private, ReadonlySpan<ReadonlyBytes> components)
 {
-    auto n = ::Crypto::UnsignedBigInteger::import_data(components[0]);
-    auto e = ::Crypto::UnsignedBigInteger::import_data(components[1]);
-    if (!is_private)
-        return new KeyHandle(::Crypto::PK::RSAPublicKey(move(n), move(e)));
+    auto key = [&]() -> ErrorOr<KeyHandle> {
+        if (!is_private)
+            return TRY(::Crypto::PK::RSAPublicKey::from_components(components[0], components[1]));
 
-    auto d = ::Crypto::UnsignedBigInteger::import_data(components[2]);
-    if (components.size() == 3)
-        return new KeyHandle(::Crypto::PK::RSAPrivateKey(move(n), move(d), move(e)));
-
-    auto p = ::Crypto::UnsignedBigInteger::import_data(components[3]);
-    auto q = ::Crypto::UnsignedBigInteger::import_data(components[4]);
-    auto dp = ::Crypto::UnsignedBigInteger::import_data(components[5]);
-    auto dq = ::Crypto::UnsignedBigInteger::import_data(components[6]);
-    auto qi = ::Crypto::UnsignedBigInteger::import_data(components[7]);
-    return new KeyHandle(::Crypto::PK::RSAPrivateKey(move(n), move(d), move(e), move(p), move(q), move(dp), move(dq), move(qi)));
+        // NB: A JWK of a key without CRT components may carry them empty.
+        auto has_crt_components = components.size() == 8 && any_of(components.slice(3), [](auto const& component) { return !component.is_empty(); });
+        Optional<::Crypto::PK::RSACRTComponents> crt_components;
+        if (has_crt_components)
+            crt_components = ::Crypto::PK::RSACRTComponents { components[3], components[4], components[5], components[6], components[7] };
+        return TRY(::Crypto::PK::RSAPrivateKey::from_components(components[0], components[1], components[2], crt_components));
+    }();
+    if (key.is_error())
+        return nullptr;
+    return new KeyHandle(key.release_value());
 }
 
 bool crypto_rsa_export_der(KeyHandle const* key, bool is_public, void* state, ReceiveEncodedBytes receive)
@@ -254,37 +233,20 @@ bool crypto_rsa_export_der(KeyHandle const* key, bool is_public, void* state, Re
 
 bool crypto_rsa_export_jwk_integer(KeyHandle const* key, u8 component, void* state, ReceiveEncodedBytes receive)
 {
-    auto const& integer = key->visit(
-        [&](::Crypto::PK::RSAPublicKey const& public_key) -> ::Crypto::UnsignedBigInteger const& {
+    auto integer = key->visit(
+        [&](::Crypto::PK::RSAPublicKey const& public_key) {
             VERIFY(component < 2);
             return component == 0 ? public_key.modulus() : public_key.public_exponent();
         },
-        [&](::Crypto::PK::RSAPrivateKey const& private_key) -> ::Crypto::UnsignedBigInteger const& {
-            switch (component) {
-            case 0:
-                return private_key.modulus();
-            case 1:
-                return private_key.public_exponent();
-            case 2:
-                return private_key.private_exponent();
-            case 3:
-                return private_key.prime1();
-            case 4:
-                return private_key.prime2();
-            case 5:
-                return private_key.exponent1();
-            case 6:
-                return private_key.exponent2();
-            case 7:
-                return private_key.coefficient();
-            }
-            VERIFY_NOT_REACHED();
+        [&](::Crypto::PK::RSAPrivateKey const& private_key) {
+            VERIFY(component <= to_underlying(::Crypto::PK::RSAPrivateKey::Component::Coefficient));
+            return private_key.component(static_cast<::Crypto::PK::RSAPrivateKey::Component>(component));
         },
-        [](auto const&) -> ::Crypto::UnsignedBigInteger const& { VERIFY_NOT_REACHED(); });
-    auto bytes = ByteBuffer::create_uninitialized(integer.byte_length());
-    if (bytes.is_error())
+        [](auto const&) -> ErrorOr<ByteBuffer> { VERIFY_NOT_REACHED(); });
+    if (integer.is_error())
         return false;
-    receive(state, integer.export_data(bytes.value().span()));
+    receive(state, integer.value());
+    secure_zero(integer.value().data(), integer.value().size());
     return true;
 }
 
@@ -293,7 +255,12 @@ bool crypto_rsa_oaep_cipher(bool encrypt, ::Crypto::Hash::HashKind hash_kind, Ke
     auto result = encrypt
         ? ::Crypto::PK::rsa_oaep_encrypt(key->get<::Crypto::PK::RSAPublicKey>(), hash_kind, label, input)
         : ::Crypto::PK::rsa_oaep_decrypt(key->get<::Crypto::PK::RSAPrivateKey>(), hash_kind, label, input);
-    return receive_byte_result(result, state, receive);
+    if (result.is_error())
+        return false;
+    receive(state, result.value());
+    if (!encrypt)
+        secure_zero(result.value().data(), result.value().size());
+    return true;
 }
 
 bool crypto_rsa_pss_sign(::Crypto::Hash::HashKind hash_kind, KeyHandle const* key, u32 salt_length, ReadonlyBytes message, void* state, ReceiveEncodedBytes receive)
@@ -517,7 +484,7 @@ FlatPtr crypto_ec_compute_coordinate(EcCurve curve, KeyHandle const* key, KeyHan
     return 0;
 }
 
-static ::Crypto::Certificate::AlgorithmIdentifier const& key_info_algorithm(Asn1Structure structure, void const* key_info)
+static ::Crypto::PK::AlgorithmIdentifier const& key_info_algorithm(Asn1Structure structure, void const* key_info)
 {
     if (structure == Asn1Structure::SubjectPublicKeyInfo)
         return static_cast<SubjectPublicKeyStorage const*>(key_info)->value.algorithm;
@@ -741,7 +708,7 @@ void crypto_asn1_key_info_raw_key(Asn1Structure structure, void const* key_info,
 
 void crypto_asn1_octet_string_bytes(OctetStringStorage const* string, ReadonlyBytes* bytes)
 {
-    *bytes = string->value.bytes();
+    *bytes = string->value;
 }
 
 bool crypto_okp_export_der(OkpCurve curve, bool is_public, ReadonlyBytes key, void* state, ReceiveEncodedBytes receive)
@@ -778,9 +745,9 @@ bool crypto_mldsa_verify(::Crypto::PK::MLDSASize, KeyHandle const*, ReadonlyByte
 FlatPtr crypto_mldsa_generate_key_pair(::Crypto::PK::MLDSASize, ReadonlyBytes, KeyHandle**, KeyHandle**);
 void crypto_asn1_key_info_identifier(Asn1Structure, void const*, ReadonlySpan<u32>*);
 KeyHandle* crypto_mldsa_key_info_read_private_key(void const*);
-KeyHandle* crypto_mldsa_read_public_key(ReadonlyBytes);
+KeyHandle* crypto_mldsa_read_public_key(::Crypto::PK::MLDSASize, ReadonlyBytes);
 void crypto_mldsa_public_bytes(KeyHandle const*, ReadonlyBytes*);
-void crypto_mldsa_seed_bytes(KeyHandle const*, ReadonlyBytes*);
+bool crypto_mldsa_seed_bytes(KeyHandle const*, void*, ReceiveEncodedBytes);
 bool crypto_mldsa_export_der(KeyHandle const*, bool, ReadonlySpan<u32>, void*, ReceiveEncodedBytes);
 }
 
@@ -805,7 +772,7 @@ bool crypto_mldsa_verify(::Crypto::PK::MLDSASize size, KeyHandle const* key, Rea
 
 FlatPtr crypto_mldsa_generate_key_pair(::Crypto::PK::MLDSASize size, ReadonlyBytes seed, KeyHandle** out_public_key, KeyHandle** out_private_key)
 {
-    auto key_pair = ::Crypto::PK::MLDSA::generate_key_pair(size, MUST(ByteBuffer::copy(seed)));
+    auto key_pair = ::Crypto::PK::MLDSA::generate_key_pair(size, seed);
     if (key_pair.is_error())
         return Utf16String::formatted("{}", key_pair.error()).into_raw();
     *out_public_key = new KeyHandle(move(key_pair.value().public_key));
@@ -823,9 +790,12 @@ KeyHandle* crypto_mldsa_key_info_read_private_key(void const* key_info)
     return new KeyHandle(static_cast<PrivateKeyStorage const*>(key_info)->value.mldsa);
 }
 
-KeyHandle* crypto_mldsa_read_public_key(ReadonlyBytes bytes)
+KeyHandle* crypto_mldsa_read_public_key(::Crypto::PK::MLDSASize size, ReadonlyBytes bytes)
 {
-    return new KeyHandle(::Crypto::PK::MLDSAPublicKey { MUST(ByteBuffer::copy(bytes)) });
+    auto public_key = ::Crypto::PK::MLDSAPublicKey::from_bytes(bytes);
+    if (public_key.is_error() || public_key.value().size() != size)
+        return nullptr;
+    return new KeyHandle(public_key.release_value());
 }
 
 void crypto_mldsa_public_bytes(KeyHandle const* key, ReadonlyBytes* bytes)
@@ -836,9 +806,15 @@ void crypto_mldsa_public_bytes(KeyHandle const* key, ReadonlyBytes* bytes)
         [](auto const&) -> ReadonlyBytes { VERIFY_NOT_REACHED(); });
 }
 
-void crypto_mldsa_seed_bytes(KeyHandle const* key, ReadonlyBytes* bytes)
+bool crypto_mldsa_seed_bytes(KeyHandle const* key, void* state, ReceiveEncodedBytes receive)
 {
-    *bytes = key->get<::Crypto::PK::MLDSAPrivateKey>().seed();
+    Array<u8, ::Crypto::PK::MLDSAPrivateKey::seed_size> buffer;
+    ScopeGuard const clear_buffer = [&] { secure_zero(buffer.data(), buffer.size()); };
+    auto seed = key->get<::Crypto::PK::MLDSAPrivateKey>().seed(buffer);
+    if (seed.is_error())
+        return false;
+    receive(state, seed.value());
+    return true;
 }
 
 bool crypto_mldsa_export_der(KeyHandle const* key, bool is_public, ReadonlySpan<u32> oid, void* state, ReceiveEncodedBytes receive)
@@ -858,7 +834,7 @@ FlatPtr crypto_mlkem_generate_key_pair(::Crypto::PK::MLKEMSize, ReadonlyBytes, K
 KeyHandle* crypto_mlkem_key_info_read_private_key(void const*);
 KeyHandle* crypto_mlkem_read_public_key(ReadonlyBytes);
 void crypto_mlkem_public_bytes(KeyHandle const*, void*, ReceiveEncodedBytes);
-void crypto_mlkem_seed_bytes(KeyHandle const*, ReadonlyBytes*);
+bool crypto_mlkem_seed_bytes(KeyHandle const*, void*, ReceiveEncodedBytes);
 bool crypto_mlkem_export_der(KeyHandle const*, bool, ReadonlySpan<u32>, void*, ReceiveEncodedBytes);
 FlatPtr crypto_mlkem_encapsulate(::Crypto::PK::MLKEMSize, KeyHandle const*, void*, void*, ReceiveEncodedBytes);
 FlatPtr crypto_mlkem_decapsulate(::Crypto::PK::MLKEMSize, KeyHandle const*, ReadonlyBytes, void*, ReceiveEncodedBytes);
@@ -870,7 +846,7 @@ static_assert(to_underlying(::Crypto::PK::MLKEMSize::MLKEM1024) == 2);
 
 FlatPtr crypto_mlkem_generate_key_pair(::Crypto::PK::MLKEMSize size, ReadonlyBytes seed, KeyHandle** out_public_key, KeyHandle** out_private_key)
 {
-    auto key_pair = ::Crypto::PK::MLKEM::generate_key_pair(size, MUST(ByteBuffer::copy(seed)));
+    auto key_pair = ::Crypto::PK::MLKEM::generate_key_pair(size, seed);
     if (key_pair.is_error())
         return Utf16String::formatted("{}", key_pair.error()).into_raw();
     *out_public_key = new KeyHandle(move(key_pair.value().public_key));
@@ -885,7 +861,10 @@ KeyHandle* crypto_mlkem_key_info_read_private_key(void const* key_info)
 
 KeyHandle* crypto_mlkem_read_public_key(ReadonlyBytes bytes)
 {
-    return new KeyHandle(::Crypto::PK::MLKEMPublicKey { MUST(ByteBuffer::copy(bytes)) });
+    auto public_key = ::Crypto::PK::MLKEMPublicKey::from_bytes(bytes);
+    if (public_key.is_error())
+        return nullptr;
+    return new KeyHandle(public_key.release_value());
 }
 
 void crypto_mlkem_public_bytes(KeyHandle const* key, void* state, ReceiveEncodedBytes receive)
@@ -893,9 +872,25 @@ void crypto_mlkem_public_bytes(KeyHandle const* key, void* state, ReceiveEncoded
     receive(state, key->get<::Crypto::PK::MLKEMPublicKey>().public_key());
 }
 
-void crypto_mlkem_seed_bytes(KeyHandle const* key, ReadonlyBytes* bytes)
+bool crypto_mlkem_seed_bytes(KeyHandle const* key, void* state, ReceiveEncodedBytes receive)
 {
-    *bytes = key->get<::Crypto::PK::MLKEMPrivateKey>().seed();
+    Array<u8, ::Crypto::PK::MLKEMPrivateKey::seed_size> buffer;
+    ScopeGuard const clear_buffer = [&] { secure_zero(buffer.data(), buffer.size()); };
+    auto seed = key->get<::Crypto::PK::MLKEMPrivateKey>().seed(buffer);
+    if (seed.is_error())
+        return false;
+    receive(state, seed.value());
+    return true;
+}
+
+extern "C" bool crypto_ml_private_key_has_seed(KeyHandle const*);
+
+bool crypto_ml_private_key_has_seed(KeyHandle const* key)
+{
+    return key->visit(
+        [](::Crypto::PK::MLDSAPrivateKey const& private_key) { return private_key.has_seed(); },
+        [](::Crypto::PK::MLKEMPrivateKey const& private_key) { return private_key.has_seed(); },
+        [](auto const&) -> bool { VERIFY_NOT_REACHED(); });
 }
 
 bool crypto_mlkem_export_der(KeyHandle const* key, bool is_public, ReadonlySpan<u32> oid, void* state, ReceiveEncodedBytes receive)
@@ -917,15 +912,17 @@ FlatPtr crypto_mlkem_encapsulate(::Crypto::PK::MLKEMSize size, KeyHandle const* 
         return Utf16String::formatted("{}", result.error()).into_raw();
     receive(shared_key, result.value().shared_key);
     receive(ciphertext, result.value().ciphertext);
+    secure_zero(result.value().shared_key.data(), result.value().shared_key.size());
     return 0;
 }
 
 FlatPtr crypto_mlkem_decapsulate(::Crypto::PK::MLKEMSize size, KeyHandle const* key, ReadonlyBytes ciphertext, void* state, ReceiveEncodedBytes receive)
 {
-    auto result = ::Crypto::PK::MLKEM::decapsulate(size, key->get<::Crypto::PK::MLKEMPrivateKey>(), MUST(ByteBuffer::copy(ciphertext)));
+    auto result = ::Crypto::PK::MLKEM::decapsulate(size, key->get<::Crypto::PK::MLKEMPrivateKey>(), ciphertext);
     if (result.is_error())
         return Utf16String::formatted("{}", result.error()).into_raw();
     receive(state, result.value());
+    secure_zero(result.value().data(), result.value().size());
     return 0;
 }
 
@@ -1060,7 +1057,7 @@ KeyHandle* crypto_public_key_for_private_key(KeyHandle const* key, FlatPtr raw_n
 {
     auto result = key->visit(
         [](::Crypto::PK::RSAPrivateKey const& private_key) -> ErrorOr<KeyHandle> {
-            return ::Crypto::PK::RSAPublicKey { private_key.modulus(), private_key.public_exponent() };
+            return TRY(private_key.public_key());
         },
         [](::Crypto::PK::ECPrivateKey const& private_key) -> ErrorOr<KeyHandle> {
             if (private_key.public_key().has_value())
@@ -1068,10 +1065,10 @@ KeyHandle* crypto_public_key_for_private_key(KeyHandle const* key, FlatPtr raw_n
             return TRY(private_key.derive_public_key());
         },
         [](::Crypto::PK::MLDSAPrivateKey const& private_key) -> ErrorOr<KeyHandle> {
-            return ::Crypto::PK::MLDSAPublicKey { private_key.public_key() };
+            return TRY(::Crypto::PK::MLDSAPublicKey::from_bytes(private_key.public_key()));
         },
         [](::Crypto::PK::MLKEMPrivateKey const& private_key) -> ErrorOr<KeyHandle> {
-            return ::Crypto::PK::MLKEMPublicKey { private_key.public_key() };
+            return TRY(::Crypto::PK::MLKEMPublicKey::from_bytes(private_key.public_key()));
         },
         [&](OKPPrivateKey const& private_key) -> ErrorOr<KeyHandle> {
             auto name = Utf16String::from_raw(raw_name);
